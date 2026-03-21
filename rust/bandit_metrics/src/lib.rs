@@ -103,8 +103,12 @@ impl Metrics {
         Ok(data.unbind())
     }
 
-    /// Setter for `data` — allows `m.data["_totals"] = {...}` pattern used by formatter tests.
-    /// Parses the Python dict back into native Rust state.
+    /// Setter for `data` — allows full property assignment `m.data = {...}` pattern
+    /// used by formatter tests. Parses the Python dict back into native Rust state.
+    ///
+    /// **Note:** Item-level mutations like `m.data["_totals"] = {...}` do NOT invoke
+    /// this setter — they mutate a temporary copy returned by the getter. Use full
+    /// property assignment (`m.data = entire_dict`) instead.
     #[setter]
     fn set_data(&mut self, _py: Python<'_>, value: &Bound<'_, PyDict>) -> PyResult<()> {
         self.entries.clear();
@@ -168,13 +172,15 @@ impl Metrics {
     /// Replicates the exact behaviour of the Python implementation including
     /// the latent bug where only the first score's values are recorded for
     /// each label (the accumulation line is inside the `if label not in` guard).
+    ///
+    /// Always validates that `begin()` has been called, even for empty scores,
+    /// matching the Python implementation which accesses `self.current` unconditionally.
     fn count_issues(&mut self, scores: &Bound<'_, PyList>) -> PyResult<()> {
         let issue_counts = Self::get_issue_counts(scores)?;
-        if issue_counts.is_none() {
-            return Ok(());
-        }
         let current = self.get_current_mut()?;
-        current.issue_counts = issue_counts;
+        if let Some(ic) = issue_counts {
+            current.issue_counts = Some(ic);
+        }
         Ok(())
     }
 
