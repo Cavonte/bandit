@@ -10,7 +10,6 @@ bandit/ source tree itself, measuring wall time and throughput (files/sec).
 Usage:
     python benchmarks/benchmark_metrics.py
 """
-import os
 import statistics
 import sys
 import time
@@ -59,7 +58,7 @@ def read_file_lines(path: Path) -> list[bytes]:
 
 def run_metrics_pipeline(
     metrics_class, file_data: list[tuple[str, list[bytes]]]
-) -> None:
+):
     """Run the full Metrics pipeline: begin → count_locs → note_nosec → count_issues → aggregate.
 
     This mirrors the real bandit pipeline where each file goes through the
