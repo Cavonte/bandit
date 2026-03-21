@@ -1122,3 +1122,296 @@ empty (or the Rust side caches which node types have plugins).
               │    └─ accumulate score│
               └───────────────────────┘
 ```
+
+---
+
+## 16. Test Coverage
+
+### 16.1 Test command and results
+
+```
+$ stestr run
+Ran: 273 tests in 3.39 sec. — Passed: 273
+```
+
+All 273 tests pass on the current codebase (branch `feat/node-visitor-rust`, parent `main`).
+
+### 16.2 Coverage summary
+
+```
+$ python -m pytest tests/ --cov=bandit.core.node_visitor --cov-report=term-missing --cov-branch
+
+Name                          Stmts   Miss Branch BrPart  Cover   Missing
+-------------------------------------------------------------------------
+bandit/core/node_visitor.py     143      6     50      6    94%   40-44, 185->exit, 195-196, 224, 244->243, 251->243, 259->240
+```
+
+**143 statements, 137 covered (96% statement). 50 branches, 44 covered (88% branch). Combined: 94%.**
+
+### 16.3 Uncovered lines analysis
+
+| Lines | Code | Why uncovered |
+|---|---|---|
+| **40-44** | `except b_utils.InvalidModulePath: LOG.warning(...); self.namespace = ""` | No test provides a `fname` that triggers `InvalidModulePath`. All functional tests use real file paths under `examples/` which resolve correctly. |
+| **185→exit** | `visit_Bytes`: the `if not isinstance(node._bandit_parent, ast.Expr)` branch where it IS an `ast.Expr` (docstring bytes) | No example file contains a bytes literal docstring (`b"..."` as a standalone expression). |
+| **195-196** | `if self.debug: LOG.debug(ast.dump(node)); self.metaast.add_node(...)` | No test runs with `debug=True`. All functional tests use `debug=False` (the manager default). |
+| **224** | `if self.debug: LOG.debug(...)` inside `visit()` | Same — no test runs with `debug=True`. |
+| **244→243** | `generic_visit` inner loop: branch where `isinstance(item, ast.AST)` is `False` | This branch fires when a list field contains non-AST items (e.g. `ast.arguments.defaults` can contain non-AST values in some edge cases). Most list fields do contain only AST nodes. |
+| **251→243** | `generic_visit`: `if self.pre_visit(item)` returning `False` | `pre_visit` always returns `True` (line 216), so this branch is dead code. Never exercised. |
+| **259→240** | `generic_visit`: `if self.pre_visit(value)` returning `False` (single-value branch) | Same — `pre_visit` always returns `True`. Dead code. |
+
+### 16.4 Test inventory
+
+There are **no direct unit tests** for `BanditNodeVisitor`. All coverage comes from **functional tests** that drive the full pipeline through `BanditManager.run_tests()` → `_parse_file` → `_execute_ast_visitor` → `BanditNodeVisitor.process()`.
+
+#### Functional tests (tests/functional/test_functional.py)
+
+All 67 functional tests exercise `BanditNodeVisitor` implicitly via the full pipeline. The table below categorises them by which node_visitor code paths they cover:
+
+| Test | Example file | AST node types exercised | Tests nosec? | Tests import tracking? | Tests score accumulation? |
+|---|---|---|---|---|---|
+| `test_skip` | `skip.py` | `Call` | **Yes** — blanket `#nosec` and `#noqa` | No (no imports) | Yes |
+| `test_ignore_skip` | `skip.py` (with `ignore_nosec=True`) | `Call` | **Yes** — verifies nosec is ignored | No | Yes |
+| `test_nosec` | `nosec.py` | `Call`, `Import`, `ImportFrom` | **Yes** — blanket `#nosec`, specific `#nosec B602`, `#nosec B607,B602`, by-name nosec | Yes (subprocess, cryptography imports) | Yes |
+| `test_multiline_sql_statements` | `sql_multiline_statements.py` | `Call`, `Import`, `FunctionDef`, `Str` | **Yes** — `#nosec` and `#nosec B608` on multiline strings | Yes (`import sqlalchemy`) | **Yes** — also tests `check_metrics` with exact nosec/skipped counts |
+| `test_metric_gathering` | `skip.py`, `imports.py` | `Call`, `Import` | **Yes** — verifies nosec count in metrics | Yes (`imports.py` tests import-based detection) | **Yes** — exact metric values verified |
+| `test_imports_aliases` | `imports-aliases.py` | `Call`, `Import`, `ImportFrom` | No | **Yes** — `import X as Y`, `from X import Y as Z` | Yes |
+| `test_imports_from` | `imports-from.py` | `Import`, `ImportFrom` | No | **Yes** — `from X import Y`, relative imports (`from . import`, `from .. import`) | Yes |
+| `test_imports_function` | `imports-function.py` | `Call`, `Import` | No | **Yes** — `__import__()` | Yes |
+| `test_imports` | `imports.py` | `Import` | No | **Yes** — dangerous module imports | Yes |
+| `test_imports_using_importlib` | `imports-with-importlib.py` | `Call`, `Import` | No | **Yes** — `importlib.import_module()` | Yes |
+| `test_exec` | `exec.py` | `Call` | No | No | Yes |
+| `test_eval` | `eval.py` | `Call` | No | No | Yes |
+| `test_asserts` | `assert.py` | `Assert` | No | No | Yes (also tests config-based skip) |
+| `test_subprocess_shell` | `subprocess_shell.py` | `Call`, `Import` | No | Yes (subprocess) | Yes |
+| `test_flask_debug_true` | `flask_debug.py` | `Call`, `Import` | No | Yes (flask) | Yes |
+| `test_hardcoded_passwords` | `hardcoded-passwords.py` | `Str`, `Call`, `Assign` | No | No | Yes |
+| `test_hardcoded_tmp` | `hardcoded-tmp.py` | `Str` | No | No | Yes |
+| `test_try_except_continue` | `try_except_continue.py` | `ExceptHandler` | No | No | Yes (with config toggling) |
+| `test_try_except_pass` | `try_except_pass.py` | `ExceptHandler` | No | No | Yes (with config toggling) |
+| `test_nonsense` | `nonsense.py` | **None** (SyntaxError) | No | No | No — tests parse failure path |
+| `test_okay` | `okay.py` | Various (clean file) | No | No | Yes — verifies zero scores |
+| `test_subdirectory_okay` | `init-py-test/subdirectory-okay.py` | Various | No | No | Yes — exercises namespace resolution via `__init__.py` |
+| `test_multiline_code` | `multiline_statement.py` | `Call` | No | No | Yes — verifies line numbers and line ranges |
+| `test_trojansource` | `trojansource.py` | **`File`** check type | No | No | Yes |
+| `test_trojansource_latin1` | `trojansource_latin1.py` | **`File`** check type | No | No | Yes |
+| `test_baseline_filter` | `flask_debug.py` | `Call` | No | Yes | Yes — verifies baseline filtering post-visit |
+| `test_crypto_md5` | `crypto-md5.py` | `Call`, `Import` | No | Yes (hashlib) | Yes |
+| `test_ciphers` | `ciphers.py` | `Call`, `Import` | No | Yes (Crypto) | Yes |
+| `test_pickle` | `pickle_deserialize.py` | `Call`, `Import` | No | Yes (pickle) | Yes |
+| `test_xml` (6 sub-tests) | `xml_*.py` | `Call`, `Import` | No | Yes (xml modules) | Yes |
+| `test_ssl_insecure_version` | `ssl-insecure-version.py` | `Call`, `Import` | No | Yes (ssl) | Yes |
+| `test_binding` | `binding.py` | `Call` | No | No | Yes |
+| `test_os_chmod` | `os-chmod.py` | `Call`, `Import` | No | Yes (os) | Yes |
+| `test_os_exec` | `os-exec.py` | `Call`, `Import` | No | Yes (os) | Yes |
+| `test_os_popen` | `os-popen.py` | `Call`, `Import` | No | Yes (os) | Yes |
+| `test_os_spawn` | `os-spawn.py` | `Call`, `Import` | No | Yes (os) | Yes |
+| `test_os_startfile` | `os-startfile.py` | `Call`, `Import` | No | Yes (os) | Yes |
+| `test_os_system` | `os_system.py` | `Call`, `Import` | No | Yes (os) | Yes |
+| `test_popen_wrappers` | `popen_wrappers.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_random_module` | `random_module.py` | `Call`, `Import` | No | Yes (random) | Yes |
+| `test_requests_ssl_verify_disabled` | `requests-ssl-verify-disabled.py` | `Call`, `Import` | No | Yes (requests) | Yes |
+| `test_requests_without_timeout` | `requests-missing-timeout.py` | `Call`, `Import` | No | Yes (requests) | Yes |
+| `test_weak_cryptographic_key` | `weak_cryptographic_key_sizes.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_wildcard_injection` | `wildcard-injection.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_yaml` | `yaml_load.py` | `Call`, `Import` | No | Yes (yaml) | Yes |
+| `test_jinja2_templating` | `jinja2_templating.py` | `Call`, `Import` | No | Yes (jinja2) | Yes |
+| `test_mako_templating` | `mako_templating.py` | `Call`, `Import` | No | Yes (mako) | Yes |
+| `test_django_sql_injection` | `django_sql_injection_extra.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_django_sql_injection_raw` | `django_sql_injection_raw.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_django_xss_secure` | `mark_safe_secure.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_django_xss_insecure` | `mark_safe_insecure.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_blacklist_pycrypto` | `pycrypto.py` | `Import` | No | Yes | Yes |
+| `test_no_blacklist_pycryptodome` | `pycryptodome.py` | `Import` | No | Yes | Yes |
+| `test_blacklist_pyghmi` | `pyghmi.py` | `Import` | No | Yes | Yes |
+| `test_snmp_security_check` | `snmp.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_host_key_verification` | `no_host_key_verification.py` | `Call`, `Import` | No | Yes (paramiko) | Yes |
+| `test_paramiko_injection` | `paramiko_injection.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_partial_path` | `partial_path_process.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_tarfile_unsafe_members` | `tarfile_unsafe_members.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_pytorch_load` | `pytorch.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_markupsafe_markup_xss` | `markupsafe_markup_xss.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_huggingface_unsafe_download` | `huggingface.py` | `Call`, `Import` | No | Yes | Yes |
+| `test_unverified_context` | `unverified_context.py` | `Call`, `Import` | No | Yes (ssl) | Yes |
+| `test_hashlib_new_insecure_functions` | `hashlib_new_insecure_functions.py` | `Call`, `Import` | No | Yes (hashlib) | Yes |
+
+#### Unit tests that indirectly relate to node_visitor components
+
+| Test file | What it tests | Relation to node_visitor |
+|---|---|---|
+| `tests/unit/core/test_context.py` | `Context` class properties and methods | Tests the wrapper that plugins receive from `run_tests`; does NOT exercise `pre_visit` context building |
+| `tests/unit/core/test_manager.py` (`test_run_tests_keyboardinterrupt`) | Manager error handling during `run_tests` | Exercises `_execute_ast_visitor` → `BanditNodeVisitor` but mocks `count_issues` |
+| `tests/unit/core/test_manager.py` (`test_run_tests_ioerror`) | Manager handling of missing files | Does NOT exercise `BanditNodeVisitor` (file open fails before visitor creation) |
+| `tests/unit/core/test_meta_ast.py` | `BanditMetaAst.add_node` and `__str__` | Tests the metaast that `pre_visit` writes to when `debug=True`, but metaast is tested in isolation |
+| `tests/unit/core/test_test_set.py` | `BanditTestSet` plugin loading | Tests the testset passed to visitor constructor |
+| `tests/unit/core/test_blacklisting.py` | Blacklist plugin dispatch | Tests the blacklist function called by tester during visit |
+
+### 16.5 Behaviours tested end-to-end only (no isolated unit test)
+
+These behaviours are exercised only through the full pipeline in functional tests. If the Rust rewrite introduces a subtle bug, these tests may not pinpoint the exact failure location:
+
+1. **`visit_Call` context enrichment** — `context["call"]`, `context["qualname"]`, `context["name"]` are set correctly. Tested implicitly by every functional test that detects a function call issue.
+2. **`visit_FunctionDef` namespace tracking** — entering/leaving a function appends/pops the namespace. Tested implicitly by `test_multiline_sql_statements` (which has nested functions) and `test_subdirectory_okay`.
+3. **`visit_ClassDef` namespace tracking** — entering/leaving a class appends/pops the namespace. Only implicitly exercised by example files that contain classes.
+4. **`visit_Import` / `visit_ImportFrom` alias accumulation** — tested by `test_imports_aliases`, `test_imports_from`, and every test with import-based detection, but only at the score level (not verifying `self.imports` or `self.import_aliases` directly).
+5. **`visit_Str` docstring suppression** — `isinstance(node._bandit_parent, ast.Expr)` check. Tested implicitly (docstrings in example files don't trigger false positives), but no test explicitly verifies suppression.
+6. **`pre_visit` context dict construction** — all 8+ keys set per node. Tested indirectly via plugin dispatch correctness, but never verified in isolation.
+7. **`generic_visit` parent/sibling injection** — `_bandit_parent` and `_bandit_sibling` attributes. Tested indirectly (plugins and `linerange` depend on them), but never directly asserted.
+8. **`update_scores` accumulation** — element-wise addition. Tested by every functional test that checks expected scores, but never in isolation.
+9. **`process()` return value** — the scores dict. Tested implicitly via `check_example` which reads `self.b_mgr.scores`.
+10. **Score-to-metrics pipeline** — `process()` returns scores → manager passes to `metrics.count_issues`. Tested by `test_metric_gathering` and `test_multiline_sql_statements` (via `check_metrics`).
+
+### 16.6 Behaviours that are entirely untested
+
+These are the **highest-risk areas** for the Rust rewrite — any regression here would be silent:
+
+1. **`InvalidModulePath` fallback** (lines 40-44) — No test provides a file path that fails `get_module_qualname_from_path`. The `self.namespace = ""` fallback is never exercised. Risk: if the Rust version handles this differently, no test would catch it.
+
+2. **`debug=True` code paths** (lines 195-196, 224) — No test runs with `debug=True`. The `metaast.add_node` and `LOG.debug(ast.dump(node))` paths are completely untested. Risk: low (debug-only), but the Rust rewrite should still support a debug mode.
+
+3. **`visit_Bytes` docstring suppression** (line 185→exit) — No test has a bytes literal as a standalone expression (docstring). The `isinstance(node._bandit_parent, ast.Expr)` check for bytes nodes is untested. Risk: medium — a Rust rewrite that doesn't suppress bytes docstrings could produce false positives.
+
+4. **`visit_Constant` with non-str/non-bytes values** — No test verifies behaviour for `Constant` nodes containing `int`, `float`, `bool`, `None`, or `Ellipsis`. `visit_Constant` silently does nothing for these types. Risk: low (no plugins target these).
+
+5. **`visit_ImportFrom` with `node.module is None`** — Relative imports like `from . import X`. The `test_imports_from` test uses `imports-from.py` which includes `from . import sys` and `from .. import sys`, providing partial coverage, but the score-level assertion doesn't directly verify the `visit_Import` delegation path.
+
+6. **Wildcard imports** (`from X import *`) — No test verifies that `self.imports.add(module + "." + "*")` and `self.import_aliases["*"]` are set correctly. The wildcard case is implicitly handled but never asserted.
+
+7. **Deeply nested AST recursion** — No test exercises `generic_visit` on a deeply nested AST (e.g. 50+ levels of nesting). Risk: a Rust iterative traversal must handle depth correctly.
+
+8. **Empty file** — No test calls `process()` on `b""` or a file with only whitespace/comments (though `test_okay` comes close with a vulnerability-free file).
+
+9. **Nosec on a line with no matching issues** — No test verifies the tester's warning log when a `# nosec B602` comment appears on a line where B602 doesn't actually trigger.
+
+10. **Multiple `visit_Import` calls accumulating state** — No test directly verifies that `self.imports` and `self.import_aliases` grow correctly across multiple import statements within a single file. This is implicitly tested by files with multiple imports, but only via score correctness.
+
+11. **`_bandit_sibling` correctness** — No test verifies that `_bandit_sibling` is set correctly (pointing to the next item in a list, or `None` for the last item). This attribute is used by `b_utils.linerange` for multiline fixup.
+
+12. **Namespace popping in `post_visit`** — No test directly verifies that `namespace_path_split` correctly pops the last component when leaving a `ClassDef` or `FunctionDef`. Tested implicitly by correct `qualname` resolution in subsequent nodes.
+
+---
+
+## 17. Acceptance Criteria
+
+The Rust implementation of `BanditNodeVisitor` must satisfy all of the following testable assertions.
+These are organised into categories with unique IDs for traceability.
+
+### AC-SCORE: Score parity
+
+| ID | Assertion |
+|---|---|
+| AC-SCORE-1 | For every file in `examples/`, the Rust visitor must produce an identical `scores` dict (`{"SEVERITY": [a,b,c,d], "CONFIDENCE": [e,f,g,h]}`) to the Python visitor. |
+| AC-SCORE-2 | For every file in `bandit/` (the bandit source itself), the Rust visitor must produce identical scores to the Python visitor. |
+| AC-SCORE-3 | Given a file with zero issues, the Rust visitor must return `{"SEVERITY": [0,0,0,0], "CONFIDENCE": [0,0,0,0]}`. |
+| AC-SCORE-4 | Given a file with issues at all four severity levels, each `SEVERITY[i]` must equal the sum of `RANKING_VALUES[level]` for all issues at that level. Same for `CONFIDENCE`. |
+| AC-SCORE-5 | `update_scores` must be commutative and associative — the order of plugin dispatch within a node type must not affect the final scores. |
+
+### AC-NOSEC: Nosec suppression correctness
+
+| ID | Assertion |
+|---|---|
+| AC-NOSEC-1 | A blanket `# nosec` comment must suppress all findings on that line and increment `metrics.nosec` by 1 per suppressed result. |
+| AC-NOSEC-2 | A specific `# nosec B602` must suppress only B602 findings and increment `metrics.skipped_tests` by 1. Other findings on the same line must NOT be suppressed. |
+| AC-NOSEC-3 | A multi-ID `# nosec B602,B607` must suppress both B602 and B607 findings. |
+| AC-NOSEC-4 | A `# nosec` on a multiline statement must suppress findings across the entire statement's line range (verified on `examples/nosec.py` lines 5-6 and 7-8). |
+| AC-NOSEC-5 | When `ignore_nosec=True` (empty `nosec_lines` dict), all nosec comments must be ignored and all findings reported. Verified by running `examples/skip.py` with and without `ignore_nosec`. |
+| AC-NOSEC-6 | Nosec by test name (`# nosec subprocess_popen_with_shell_equals_true`) must suppress the named test. |
+| AC-NOSEC-7 | The Rust visitor must produce identical nosec and skipped_tests metric counts as the Python visitor for `examples/sql_multiline_statements.py` (expected: `nosec=7`, `skipped_tests=8`). |
+| AC-NOSEC-8 | The Rust visitor must produce identical nosec metric counts as the Python visitor for `examples/skip.py` (expected: `nosec=2`, `loc=7`). |
+
+### AC-IMPORT: Import tracking correctness
+
+| ID | Assertion |
+|---|---|
+| AC-IMPORT-1 | `import X` must add `"X"` to `self.imports`. |
+| AC-IMPORT-2 | `import X as Y` must add `"X"` to `self.imports` AND `{"Y": "X"}` to `self.import_aliases`. |
+| AC-IMPORT-3 | `from X import Y` must add `"X.Y"` to `self.imports` AND `{"Y": "X.Y"}` to `self.import_aliases`. |
+| AC-IMPORT-4 | `from X import Y as Z` must add `"X.Y"` to `self.imports` AND `{"Z": "X.Y"}` to `self.import_aliases`. |
+| AC-IMPORT-5 | `from . import Y` (relative import, `module is None`) must delegate to `visit_Import` logic — `"Y"` added to `self.imports`. |
+| AC-IMPORT-6 | Import aliases must be usable by `visit_Call` to resolve qualified names. Verified by `examples/imports-aliases.py`: `import hashlib as h; h.md5('1')` must resolve to `hashlib.md5` and trigger B324. |
+| AC-IMPORT-7 | Multiple imports in the same file must accumulate — `self.imports` and `self.import_aliases` must contain entries from all import statements visited so far. |
+
+### AC-TRAVERSE: AST traversal correctness
+
+| ID | Assertion |
+|---|---|
+| AC-TRAVERSE-1 | Every AST node in the file must be visited exactly once (depth-first, field-order). |
+| AC-TRAVERSE-2 | `_bandit_parent` must be set on every visited node to its immediate parent in the AST. |
+| AC-TRAVERSE-3 | `_bandit_sibling` must be set to the next item in a list field, or `None` if last. |
+| AC-TRAVERSE-4 | `visit_Str` must NOT dispatch plugins for string literals that are docstrings (parent is `ast.Expr`). |
+| AC-TRAVERSE-5 | `visit_Bytes` must NOT dispatch plugins for bytes literals that are docstrings (parent is `ast.Expr`). |
+| AC-TRAVERSE-6 | `visit_Constant` must delegate to `visit_Str` for `str` values and `visit_Bytes` for `bytes` values. Other constant types must NOT trigger Str/Bytes dispatch. |
+| AC-TRAVERSE-7 | Node types without named visitors (e.g. `Assert`, `ExceptHandler`) must still trigger `tester.run_tests` with the correct node type name. |
+| AC-TRAVERSE-8 | After `generic_visit` completes, `process()` must run `tester.run_tests(context, "File")` to dispatch file-level plugins. |
+
+### AC-NAMESPACE: Namespace resolution correctness
+
+| ID | Assertion |
+|---|---|
+| AC-NAMESPACE-1 | `self.namespace` must be initialised from the file path using `get_module_qualname_from_path`. For `examples/assert.py`, namespace should derive from the path. |
+| AC-NAMESPACE-2 | Entering a `ClassDef` must append `node.name` to the namespace. |
+| AC-NAMESPACE-3 | Entering a `FunctionDef` must append the function name to the namespace. |
+| AC-NAMESPACE-4 | Leaving a `ClassDef` or `FunctionDef` (in `post_visit`) must pop the last component from the namespace. |
+| AC-NAMESPACE-5 | For nested structures (class containing a method), `qualname` in `visit_FunctionDef` must be `module.ClassName.method_name`. |
+| AC-NAMESPACE-6 | If `get_module_qualname_from_path` raises `InvalidModulePath`, `self.namespace` must default to `""`. |
+
+### AC-CONTEXT: Context object correctness
+
+| ID | Assertion |
+|---|---|
+| AC-CONTEXT-1 | `pre_visit` must set `imports`, `import_aliases`, `node`, `linerange`, `filename`, `file_data` for every node. |
+| AC-CONTEXT-2 | `pre_visit` must set `lineno` if the node has a `lineno` attribute. |
+| AC-CONTEXT-3 | `pre_visit` must set `col_offset` and `end_col_offset` if the node has those attributes. |
+| AC-CONTEXT-4 | `visit_Call` must set `call`, `qualname`, and `name` in the context. |
+| AC-CONTEXT-5 | `visit_FunctionDef` must set `function`, `qualname`, and `name` in the context. |
+| AC-CONTEXT-6 | `visit_Import` and `visit_ImportFrom` must set `module` in the context. `visit_ImportFrom` must also set `name`. |
+| AC-CONTEXT-7 | `visit_Str` must set `str` in the context. `visit_Bytes` must set `bytes` in the context. |
+
+### AC-METRICS: Metrics integration correctness
+
+| ID | Assertion |
+|---|---|
+| AC-METRICS-1 | The Rust visitor must call `metrics.note_nosec()` the same number of times as the Python visitor for any given file. |
+| AC-METRICS-2 | The Rust visitor must call `metrics.note_skipped_test()` the same number of times as the Python visitor for any given file. |
+| AC-METRICS-3 | After `process()` returns, `metrics.count_issues([scores])` must receive the same scores from the Rust visitor as from the Python visitor. |
+| AC-METRICS-4 | For `examples/skip.py`, post-aggregation metrics must show `nosec=2`, `loc=7`, `SEVERITY.LOW=5`, `CONFIDENCE.HIGH=5`. |
+| AC-METRICS-5 | For `examples/imports.py`, post-aggregation metrics must show `nosec=0`, `loc=4`, `SEVERITY.LOW=2`, `CONFIDENCE.HIGH=2`. |
+
+### AC-RESULT: Issue result parity
+
+| ID | Assertion |
+|---|---|
+| AC-RESULT-1 | For every file in `examples/`, the Rust visitor must produce the same list of `Issue` objects (same `test_id`, `severity`, `confidence`, `lineno`, `linerange`, `text`, `fname`). |
+| AC-RESULT-2 | Issue ordering must match — plugins are dispatched in testset order, and issues must be appended to `tester.results` in the same sequence. |
+| AC-RESULT-3 | The `test` attribute on each `Issue` (set by the tester to `test.__name__`) must match between Python and Rust implementations. |
+| AC-RESULT-4 | The `test_id` attribute on each `Issue` must match. |
+
+### AC-EDGE: Edge case handling
+
+| ID | Assertion |
+|---|---|
+| AC-EDGE-1 | An empty file (`b""`) must parse without error, produce zero scores, and still run `"File"` plugins. |
+| AC-EDGE-2 | A file with only comments must parse without error and produce zero scores. |
+| AC-EDGE-3 | A file that fails `ast.parse` (syntax error) must be handled by the caller (manager), not crash the visitor. |
+| AC-EDGE-4 | A file with wildcard imports (`from os import *`) must add `"os.*"` to imports and `{"*": "os.*"}` to import_aliases. |
+| AC-EDGE-5 | A file with deeply nested AST (30+ levels) must complete without stack overflow. |
+| AC-EDGE-6 | A file with `visit_ClassDef` immediately followed by `visit_FunctionDef` must correctly track namespace (push class, push function, pop function, pop class). |
+
+### AC-COMPAT: Drop-in compatibility
+
+| ID | Assertion |
+|---|---|
+| AC-COMPAT-1 | The Rust visitor must expose the same constructor signature: `__init__(self, fname, fdata, metaast, testset, debug, nosec_lines, metrics)`. |
+| AC-COMPAT-2 | `process(data)` must accept `bytes` and return a `dict` with the same shape as the Python version. |
+| AC-COMPAT-3 | `self.tester.results` must be accessible from Python after `process()` returns, containing the same `Issue` objects. |
+| AC-COMPAT-4 | The Rust visitor must work with the existing Python `BanditTester`, `BanditTestSet`, `Context`, and all existing Python plugins without modification. |
+| AC-COMPAT-5 | `manager._execute_ast_visitor` must be able to use the Rust visitor as a drop-in replacement without any changes to manager.py. |
+| AC-COMPAT-6 | All 273 existing tests must pass when the Rust visitor replaces the Python visitor. |
+
+### AC-REGRESSION: Full parity test
+
+| ID | Assertion |
+|---|---|
+| AC-REGRESSION-1 | A parametrised test must run both Python and Rust visitors on every file in `examples/` and assert identical `(scores, results, metrics)` tuples. |
+| AC-REGRESSION-2 | A parametrised test must run both visitors on every `.py` file in `bandit/` and assert identical output. |
+| AC-REGRESSION-3 | Performance must not regress — the Rust visitor must process files at least as fast as the Python visitor (wall time per file). |
