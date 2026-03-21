@@ -88,6 +88,12 @@ class TestConstruction:
         with pytest.raises((AttributeError, Exception)):
             m2.count_locs([b"x"])
 
+    def test_ac_init_4_count_issues_empty_before_begin(self, MetricsClass):
+        """AC-INIT-4: count_issues([]) before begin() must raise, even with empty scores."""
+        m = _make_metrics(MetricsClass)
+        with pytest.raises((AttributeError, Exception)):
+            m.count_issues([])
+
 
 # ---------------------------------------------------------------------------
 # §12.2 Per-file lifecycle
