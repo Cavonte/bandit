@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "bandit_metrics",
+    "bandit_node_visitor",
+]
+resolver = "2"
+
+[workspace.dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }

@@ -20,7 +20,16 @@ from bandit.core import extension_loader
 from bandit.core import issue
 from bandit.core import meta_ast as b_meta_ast
 from bandit.core import metrics
-from bandit.core import node_visitor as b_node_visitor
+
+try:
+    from bandit_node_visitor import BanditNodeVisitor as _RustBanditNodeVisitor
+
+    class _RustNodeVisitorModule:
+        BanditNodeVisitor = _RustBanditNodeVisitor
+
+    b_node_visitor = _RustNodeVisitorModule()
+except ImportError:
+    from bandit.core import node_visitor as b_node_visitor
 from bandit.core import test_set as b_test_set
 
 LOG = logging.getLogger(__name__)

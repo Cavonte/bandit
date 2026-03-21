@@ -1,10 +1,10 @@
 [package]
-name = "bandit_metrics"
+name = "bandit_node_visitor"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "bandit_metrics"
+name = "bandit_node_visitor"
 crate-type = ["cdylib"]
 
 [dependencies]
