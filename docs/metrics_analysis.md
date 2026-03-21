@@ -695,3 +695,238 @@ Expected JSON output shape:
   }
 }
 ```
+
+---
+
+## 11. Test Coverage
+
+### 11.1 Test command and results
+
+```
+$ python -m stestr run
+Ran: 273 tests in 3.79 sec.
+ - Passed: 273
+ - Skipped: 0
+ - Failed: 0
+```
+
+Coverage command (scoped to `bandit/core/metrics.py`):
+
+```
+$ python -m pytest tests/ -q --cov=bandit.core.metrics --cov-report=term-missing --cov-branch
+
+Name                     Stmts   Miss Branch BrPart  Cover   Missing
+--------------------------------------------------------------------
+bandit/core/metrics.py      40      0     14      1    98%   99->97
+--------------------------------------------------------------------
+TOTAL                       40      0     14      1    98%
+274 passed
+```
+
+**98% coverage.** All 40 statements are executed. 13 of 14 branches are covered. The single
+partial branch miss is explained in §11.4 below.
+
+### 11.2 Test files that touch Metrics
+
+#### Direct Metrics tests
+
+| Test file | Description |
+|---|---|
+| `tests/functional/test_functional.py::test_metric_gathering` | **Only direct test of Metrics output.** Runs `skip.py` and `imports.py` through the full pipeline and asserts that `metrics.data["_totals"]` contains the expected `loc`, `nosec`, and issue counts. Exercises the complete lifecycle: `__init__` → `begin` → `count_locs` → `note_nosec` → `count_issues` → `aggregate`. |
+
+#### Tests that exercise Metrics indirectly (through the full pipeline)
+
+| Test file | Description |
+|---|---|
+| `tests/functional/test_functional.py::check_example` (called by ~50 tests) | Runs real example files through `BanditManager.run_tests()`, which internally calls `begin()`, `count_locs()`, `count_issues()`, and `aggregate()`. These tests validate issue scores but do not directly assert on `metrics.data`. |
+| `tests/functional/test_functional.py::test_nonsense` | Runs a syntactically invalid file; exercises the edge case where `begin()` and `count_locs()` are called but `count_issues()` may not be (due to parse failure). |
+| `tests/unit/core/test_manager.py::test_run_tests_keyboardinterrupt` | Mocks `Metrics.count_issues` to raise `KeyboardInterrupt`. Verifies the manager exits cleanly. Tests that `begin()` and `count_locs()` run before `count_issues()`. |
+| `tests/unit/core/test_manager.py::test_run_tests_ioerror` | Tests the case where a file cannot be opened. `begin()` is never called for the missing file. |
+| `tests/unit/core/test_manager.py::test_output_results_valid_format` | Calls `output_results()` with format `"txt"`, which triggers the text formatter, which reads `metrics.data["_totals"]`. |
+
+#### Tests that use Metrics as a fixture (mock/stub usage)
+
+| Test file | Description |
+|---|---|
+| `tests/unit/formatters/test_json.py` | Creates a fresh `Metrics()` instance, manually populates `metrics.data` with `_totals` and a per-file entry, then calls the JSON formatter. Validates that `metrics.data` is serialised correctly in JSON output. |
+| `tests/unit/formatters/test_yaml.py` | Same pattern as `test_json.py`. Creates `Metrics()`, populates `data` manually, calls the YAML formatter. |
+| `tests/unit/formatters/test_sarif.py` | Same pattern. Creates `Metrics()`, populates `data` manually, calls the SARIF formatter. Validates that metrics appear in SARIF run properties. |
+| `tests/unit/formatters/test_html.py` | Directly mutates `manager.metrics.data["_totals"]` (sets `loc` and `nosec`). Does **not** create a fresh `Metrics()` — uses the one created by `BanditManager.__init__()`. Tests that HTML output contains the correct `loc` and `nosec` values. |
+| `tests/unit/formatters/test_screen.py` | Directly mutates `manager.metrics.data["_totals"]` with all 11 keys. Tests that screen output includes all issue counts by severity/confidence, plus `loc` and `nosec`. |
+| `tests/unit/formatters/test_text.py` | Directly mutates `manager.metrics.data["_totals"]` with all 11 keys (including `skipped_tests`). Tests that text output includes all metrics fields. **Only formatter test that checks `skipped_tests`.** |
+
+### 11.3 Behaviours tested implicitly but not by direct unit tests
+
+The following Metrics behaviours are exercised **only through integration/functional tests**
+(via `BanditManager.run_tests()`) and have no isolated unit tests:
+
+| Behaviour | Tested via |
+|---|---|
+| `__init__()` initialises `_totals` with all 11 keys | `test_functional.py::test_metric_gathering` (implicitly — asserts on `_totals` values after full run) |
+| `begin(fname)` creates a per-file entry | All `check_example` functional tests (implicitly) |
+| `count_locs(lines)` counts non-blank, non-comment lines | `test_metric_gathering` (asserts `loc=7` for `skip.py`, `loc=4` for `imports.py`) |
+| `note_nosec()` increments nosec count | `test_metric_gathering` (asserts `nosec=2` for `skip.py`) |
+| `note_skipped_test()` increments skipped_tests | Never directly asserted in any test (see §11.4) |
+| `count_issues(scores)` records issue counts per file | `test_metric_gathering` (asserts issue counts in `_totals`) |
+| `aggregate()` sums all per-file entries into `_totals` | `test_metric_gathering` (asserts on `_totals` post-aggregation) |
+| `_get_issue_counts(scores)` computes counts from weighted scores | `test_metric_gathering` and all `check_example` tests (implicitly) |
+| `self.current` reference aliasing | All pipeline tests (implicitly — `note_nosec` and `count_locs` work through `self.current`) |
+| `data` dict consumed by formatters | All formatter tests (test_json, test_yaml, test_sarif, test_html, test_screen, test_text) |
+
+### 11.4 Uncovered lines, branches, and behaviours
+
+#### Partial branch: line 99→97
+
+```python
+97:                for i, rank in enumerate(constants.RANKING):
+98:                    label = f"{criteria}.{rank}"
+99:                    if label not in issue_counts:    # ← this branch
+100:                        issue_counts[label] = 0
+```
+
+The `else` branch (label already in `issue_counts`) is **never taken** in any test.
+This is because `count_issues()` is always called with a single-element list `[score]`,
+so each label is encountered exactly once. The `if` guard is dead code in practice — the
+"already exists" path would only trigger if `scores` contained multiple elements with
+overlapping criteria/rank combinations. As noted in §3.8, the accumulation logic inside the
+`if` block means the second score's values would be silently discarded anyway (a latent bug).
+
+#### Entirely untested behaviours (highest risk for rewrite)
+
+| # | Behaviour | Risk |
+|---|---|---|
+| 1 | **`note_skipped_test()` effect on `_totals`** | No test asserts `skipped_tests` in `_totals` after a full pipeline run. The text formatter test sets it manually. If the Rust implementation fails to count skipped tests, no existing test will catch it. |
+| 2 | **`aggregate()` called with no files scanned** | No test creates a `Metrics` instance, calls `aggregate()` with zero files, and asserts `_totals` remains all zeros. |
+| 3 | **`aggregate()` called twice** (double-counting) | No test verifies that calling `aggregate()` twice produces incorrect results (or guards against it). |
+| 4 | **`begin()` called twice with the same filename** | No test verifies that the second call overwrites the first entry. |
+| 5 | **`count_locs()` with empty line list** | No test passes an empty `lines=[]` to `count_locs()` and asserts `loc=0`. |
+| 6 | **`count_issues()` with empty scores list** | No test passes `scores=[]` and verifies that no issue-count keys are added. |
+| 7 | **`_get_issue_counts()` with multiple scores** | No test calls with `len(scores) > 1`. The dead branch (§11.4 above) and the accumulation bug are both untested. |
+| 8 | **`note_nosec(num=N)` with `num > 1`** | No test calls `note_nosec` with a non-default `num` argument. |
+| 9 | **`note_skipped_test(num=N)` with `num > 1`** | Same — no test calls with a non-default `num`. |
+| 10 | **Per-file entries missing issue-count keys after `SyntaxError`** | The `test_nonsense` functional test checks that the file is skipped, but does not inspect `metrics.data` for the partial entry. |
+| 11 | **Serialisation format of `metrics.data`** | JSON/YAML/SARIF tests check that the formatter output is valid, but they use manually populated `data` dicts. No test verifies that `aggregate()` output matches the key format expected by formatters. |
+
+---
+
+## 12. Acceptance Criteria
+
+The Rust implementation of `Metrics` must satisfy the following testable assertions to be
+considered a correct replacement. Each criterion is framed as a test that can be automated.
+
+### 12.1 Construction
+
+1. **AC-INIT-1:** After construction, `data["_totals"]` must exist with exactly 11 keys:
+   `loc=0`, `nosec=0`, `skipped_tests=0`, and the 8 issue-count keys
+   (`SEVERITY.UNDEFINED=0`, `SEVERITY.LOW=0`, `SEVERITY.MEDIUM=0`, `SEVERITY.HIGH=0`,
+   `CONFIDENCE.UNDEFINED=0`, `CONFIDENCE.LOW=0`, `CONFIDENCE.MEDIUM=0`, `CONFIDENCE.HIGH=0`).
+
+2. **AC-INIT-2:** After construction, `data` must contain exactly one key (`"_totals"`).
+
+3. **AC-INIT-3:** No `current` file must be set after construction. Calling `note_nosec()`
+   or `count_locs()` before `begin()` must fail explicitly (panic or `Result::Err`).
+
+### 12.2 Per-file lifecycle (`begin` → `count_locs` → `note_*` → `count_issues`)
+
+4. **AC-BEGIN-1:** After `begin("foo.py")`, `data["foo.py"]` must exist with
+   `{"loc": 0, "nosec": 0, "skipped_tests": 0}`. It must not contain issue-count keys yet.
+
+5. **AC-BEGIN-2:** After `begin("foo.py")`, subsequent `note_nosec()`, `note_skipped_test()`,
+   and `count_locs()` calls must modify `data["foo.py"]` (not any other entry).
+
+6. **AC-BEGIN-3:** Calling `begin("bar.py")` after `begin("foo.py")` must switch the active
+   file to `bar.py`. Subsequent mutations must affect `data["bar.py"]`.
+
+7. **AC-LOC-1:** `count_locs([b"code", b"  ", b"# comment", b"  # comment", b"", b"more"])`
+   must add exactly `2` to the current file's `loc` (only `b"code"` and `b"more"` count).
+
+8. **AC-LOC-2:** `count_locs([])` must add `0` to `loc`.
+
+9. **AC-LOC-3:** Lines containing only whitespace must not count as code.
+
+10. **AC-LOC-4:** Lines starting with `#` (after stripping whitespace) must not count as code.
+
+11. **AC-NOSEC-1:** Each call to `note_nosec()` must increment `data[current_file]["nosec"]` by 1.
+
+12. **AC-NOSEC-2:** `note_nosec(5)` must increment `nosec` by 5.
+
+13. **AC-SKIP-1:** Each call to `note_skipped_test()` must increment
+    `data[current_file]["skipped_tests"]` by 1.
+
+14. **AC-SKIP-2:** `note_skipped_test(3)` must increment `skipped_tests` by 3.
+
+15. **AC-ISSUES-1:** After `count_issues([{"SEVERITY": [0, 3, 5, 10], "CONFIDENCE": [1, 0, 0, 0]}])`,
+    the current file's entry must contain:
+    ```
+    SEVERITY.UNDEFINED=0, SEVERITY.LOW=1, SEVERITY.MEDIUM=1, SEVERITY.HIGH=1,
+    CONFIDENCE.UNDEFINED=1, CONFIDENCE.LOW=0, CONFIDENCE.MEDIUM=0, CONFIDENCE.HIGH=0
+    ```
+    (Each score value is divided by the corresponding `RANKING_VALUES`: UNDEFINED=1, LOW=3, MEDIUM=5, HIGH=10.)
+
+16. **AC-ISSUES-2:** `count_issues([])` (empty scores list) must be a no-op — no issue-count
+    keys added to the current file's entry.
+
+### 12.3 Aggregation
+
+17. **AC-AGG-1:** After processing files `A` and `B`, `aggregate()` must set
+    `data["_totals"][key] == data["A"][key] + data["B"][key]` for every key present in
+    either file's entry.
+
+18. **AC-AGG-2:** After `aggregate()`, `data["_totals"]` must contain all keys that appear
+    in any per-file entry, plus the initial 11 keys from construction.
+
+19. **AC-AGG-3:** If no files were processed (only `_totals` exists), `aggregate()` must
+    leave `_totals` as all zeros.
+
+20. **AC-AGG-4:** `aggregate()` must be idempotent-safe for single invocation. (Note: the
+    Python implementation is **not** safe for double invocation — calling it twice doubles
+    the totals. The Rust implementation may choose to guard against this or document the
+    same behaviour.)
+
+### 12.4 Serialisation compatibility
+
+21. **AC-SER-1:** `data` must be serialisable to JSON with the exact key format used by the
+    Python implementation:
+    - Top-level keys: file paths (strings) and `"_totals"`
+    - Per-entry keys: `"loc"`, `"nosec"`, `"skipped_tests"`, `"SEVERITY.UNDEFINED"`,
+      `"SEVERITY.LOW"`, `"SEVERITY.MEDIUM"`, `"SEVERITY.HIGH"`, `"CONFIDENCE.UNDEFINED"`,
+      `"CONFIDENCE.LOW"`, `"CONFIDENCE.MEDIUM"`, `"CONFIDENCE.HIGH"`
+
+22. **AC-SER-2:** All values must be non-negative integers (serialised as JSON numbers, not strings).
+
+23. **AC-SER-3:** Per-file entries that never had `count_issues()` called must serialise
+    with only `"loc"`, `"nosec"`, `"skipped_tests"` keys (no issue-count keys).
+
+### 12.5 Formatter consumption
+
+24. **AC-FMT-1:** The following read paths must work correctly after `aggregate()`:
+    - `data["_totals"]["loc"]` → integer
+    - `data["_totals"]["nosec"]` → integer
+    - `data["_totals"]["skipped_tests"]` → integer
+    - `data["_totals"]["SEVERITY.{UNDEFINED,LOW,MEDIUM,HIGH}"]` → integer
+    - `data["_totals"]["CONFIDENCE.{UNDEFINED,LOW,MEDIUM,HIGH}"]` → integer
+
+25. **AC-FMT-2:** The full `data` dict (all entries including `_totals` and per-file entries)
+    must be consumable as a flat `HashMap<String, HashMap<String, i64>>` (or equivalent)
+    for JSON/YAML/SARIF serialisation.
+
+### 12.6 Edge cases
+
+26. **AC-EDGE-1:** `nosec` may exceed `loc`. The implementation must not enforce
+    `nosec <= loc`.
+
+27. **AC-EDGE-2:** Calling `begin()` with the same filename twice must overwrite the
+    previous entry (matching Python behaviour).
+
+28. **AC-EDGE-3:** If `count_issues()` is never called for a file, `aggregate()` must
+    still sum that file's `loc`, `nosec`, and `skipped_tests` into `_totals`.
+
+### 12.7 Regression test: existing Python test suite
+
+29. **AC-COMPAT-1:** The Rust implementation must produce identical `data` output (after
+    `aggregate()`) as the Python implementation when run against the same input files.
+    Verify by running the functional test `test_metric_gathering` against both implementations
+    and comparing `metrics.data["_totals"]`.
+
+30. **AC-COMPAT-2:** All 6 formatter tests (JSON, YAML, SARIF, HTML, screen, text) must
+    produce valid output when consuming the Rust implementation's `data` dict.
