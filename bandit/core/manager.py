@@ -7,6 +7,8 @@ import fnmatch
 import io
 import json
 import logging
+import math
+import multiprocessing
 import os
 import re
 import sys
@@ -27,6 +29,81 @@ LOG = logging.getLogger(__name__)
 NOSEC_COMMENT = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
 NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
 PROGRESS_THRESHOLD = 50
+
+_PARALLEL_THRESHOLD = 8    # minimum files before parallelism kicks in
+_PARALLEL_CHUNK_SIZE = None  # None = auto: ceil(len(files) / cpu_count())
+
+
+def _scan_file_chunk(args):
+    """Top-level worker function for parallel file scanning.
+
+    Must be module-level (not a method) for pickling with forkserver.
+    """
+    file_chunk, config, profile, debug, ignore_nosec = args
+
+    b_ts_local = b_test_set.BanditTestSet(config, profile)
+    b_ma_local = b_meta_ast.BanditMetaAst()
+    m = metrics.Metrics()
+
+    results = []
+    scores = []
+    skipped = []
+
+    for fname, raw_bytes in file_chunk:
+        try:
+            fdata = io.BytesIO(raw_bytes)
+            lines = raw_bytes.splitlines()
+            m.begin(fname)
+            m.count_locs(lines)
+
+            nosec_lines = {}
+            try:
+                fdata.seek(0)
+                tokens = tokenize.tokenize(fdata.readline)
+                if not ignore_nosec:
+                    for toktype, tokval, (lineno, _), _, _ in tokens:
+                        if toktype == tokenize.COMMENT:
+                            nosec_lines[lineno] = _parse_nosec_comment(tokval)
+            except tokenize.TokenError:
+                pass
+
+            fdata.seek(0)
+            score = []
+            res = b_node_visitor.BanditNodeVisitor(
+                fname,
+                fdata,
+                b_ma_local,
+                b_ts_local,
+                debug,
+                nosec_lines,
+                m,
+            )
+            score = res.process(raw_bytes)
+            results.extend(res.tester.results)
+            scores.append(score)
+            m.count_issues([score])
+        except SyntaxError:
+            skipped.append(
+                (fname, "syntax error while parsing AST from file")
+            )
+        except Exception as e:
+            LOG.error(
+                "Exception occurred when executing tests against %s.",
+                fname,
+            )
+            skipped.append((fname, "exception while scanning file"))
+            LOG.debug("  Exception string: %s", e)
+            LOG.debug(
+                "  Exception traceback: %s", traceback.format_exc()
+            )
+
+    # Return raw per-file data; the manager will aggregate once.
+    return {
+        "metrics_data": m.data,
+        "results": results,
+        "scores": scores,
+        "skipped": skipped,
+    }
 
 
 class BanditManager:
@@ -266,31 +343,116 @@ class BanditManager:
         # if we have problems with a file, we'll remove it from the files_list
         # and add it to the skipped list instead
         new_files_list = list(self.files_list)
-        if (
-            len(self.files_list) > PROGRESS_THRESHOLD
-            and LOG.getEffectiveLevel() <= logging.INFO
-        ):
-            files = progress.track(self.files_list)
+
+        # Determine whether to use serial or parallel path
+        use_serial = (
+            len(self.files_list) < _PARALLEL_THRESHOLD
+            or "-" in self.files_list
+        )
+
+        if use_serial:
+            # --- Serial fallback (original path) ---
+            if (
+                len(self.files_list) > PROGRESS_THRESHOLD
+                and LOG.getEffectiveLevel() <= logging.INFO
+            ):
+                files = progress.track(self.files_list)
+            else:
+                files = self.files_list
+
+            for count, fname in enumerate(files):
+                LOG.debug("working on file : %s", fname)
+
+                try:
+                    if fname == "-":
+                        open_fd = os.fdopen(sys.stdin.fileno(), "rb", 0)
+                        fdata = io.BytesIO(open_fd.read())
+                        new_files_list = [
+                            "<stdin>" if x == "-" else x
+                            for x in new_files_list
+                        ]
+                        self._parse_file("<stdin>", fdata, new_files_list)
+                    else:
+                        with open(fname, "rb") as fdata:
+                            self._parse_file(fname, fdata, new_files_list)
+                except OSError as e:
+                    self.skipped.append((fname, e.strerror))
+                    new_files_list.remove(fname)
         else:
-            files = self.files_list
+            # --- Parallel path ---
+            # Pre-read all files into memory
+            file_data_pairs = []
+            if (
+                len(self.files_list) > PROGRESS_THRESHOLD
+                and LOG.getEffectiveLevel() <= logging.INFO
+            ):
+                files_iter = progress.track(self.files_list)
+            else:
+                files_iter = self.files_list
 
-        for count, fname in enumerate(files):
-            LOG.debug("working on file : %s", fname)
+            for fname in files_iter:
+                try:
+                    with open(fname, "rb") as f:
+                        raw_bytes = f.read()
+                    file_data_pairs.append((fname, raw_bytes))
+                except OSError as e:
+                    self.skipped.append((fname, e.strerror))
+                    new_files_list.remove(fname)
 
-            try:
-                if fname == "-":
-                    open_fd = os.fdopen(sys.stdin.fileno(), "rb", 0)
-                    fdata = io.BytesIO(open_fd.read())
-                    new_files_list = [
-                        "<stdin>" if x == "-" else x for x in new_files_list
-                    ]
-                    self._parse_file("<stdin>", fdata, new_files_list)
+            if file_data_pairs:
+                # Chunk files across workers
+                cpu_count = multiprocessing.cpu_count()
+                if _PARALLEL_CHUNK_SIZE is not None:
+                    chunk_size = _PARALLEL_CHUNK_SIZE
                 else:
-                    with open(fname, "rb") as fdata:
-                        self._parse_file(fname, fdata, new_files_list)
-            except OSError as e:
-                self.skipped.append((fname, e.strerror))
-                new_files_list.remove(fname)
+                    chunk_size = math.ceil(
+                        len(file_data_pairs) / cpu_count
+                    )
+                chunk_size = max(chunk_size, 1)
+
+                chunks = [
+                    file_data_pairs[i:i + chunk_size]
+                    for i in range(0, len(file_data_pairs), chunk_size)
+                ]
+                n_workers = min(cpu_count, len(chunks))
+
+                chunk_args = [
+                    (
+                        chunk,
+                        self.b_conf,
+                        {},
+                        self.debug,
+                        self.ignore_nosec,
+                    )
+                    for chunk in chunks
+                ]
+
+                with multiprocessing.Pool(
+                    processes=n_workers
+                ) as pool:
+                    worker_results = pool.map(
+                        _scan_file_chunk, chunk_args
+                    )
+
+                # Merge results from all workers
+                merged_metrics = {}
+                for wr in worker_results:
+                    self.results.extend(wr["results"])
+                    self.scores.extend(wr["scores"])
+                    self.skipped.extend(wr["skipped"])
+
+                    for key, value in wr["metrics_data"].items():
+                        if key != "_totals":
+                            merged_metrics[key] = value
+
+                # Write merged metrics with full property assignment
+                self.metrics.data = merged_metrics
+
+                # Remove skipped files from new_files_list
+                skipped_fnames = {s[0] for s in self.skipped}
+                new_files_list = [
+                    f for f in new_files_list if f not in skipped_fnames
+                ]
 
         # reflect any files which may have been skipped
         self.files_list = new_files_list
