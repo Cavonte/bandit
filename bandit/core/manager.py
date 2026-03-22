@@ -30,7 +30,6 @@ NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
 PROGRESS_THRESHOLD = 50
 
 _PARALLEL_THRESHOLD = 8    # minimum files before parallelism kicks in
-_PARALLEL_CHUNK_SIZE = None  # None = auto: ceil(len(files) / cpu_count())
 
 # Module-level state used by parallel workers.  Populated by the parent
 # process before forking so that children inherit the data directly
