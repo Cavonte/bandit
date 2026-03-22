@@ -7,7 +7,6 @@ import fnmatch
 import io
 import json
 import logging
-import math
 import multiprocessing
 import os
 import re
@@ -33,15 +32,36 @@ PROGRESS_THRESHOLD = 50
 _PARALLEL_THRESHOLD = 8    # minimum files before parallelism kicks in
 _PARALLEL_CHUNK_SIZE = None  # None = auto: ceil(len(files) / cpu_count())
 
+# Module-level state used by parallel workers.  Populated by the parent
+# process before forking so that children inherit the data directly
+# (no pickling through pipes).
+_worker_file_data = []   # list of (fname, raw_bytes)
+_worker_ts = None        # BanditTestSet  – built once per worker process
+_worker_debug = False
+_worker_ignore_nosec = False
 
-def _scan_file_chunk(args):
+
+def _worker_init(config, profile, debug, ignore_nosec):
+    """Pool initializer — runs once in each worker process.
+
+    Reconstructs the unpicklable BanditTestSet from (config, profile)
+    so it is never sent across process boundaries.
+    """
+    global _worker_ts, _worker_debug, _worker_ignore_nosec
+    _worker_ts = b_test_set.BanditTestSet(config, profile)
+    _worker_debug = debug
+    _worker_ignore_nosec = ignore_nosec
+
+
+def _scan_file_chunk(indices):
     """Top-level worker function for parallel file scanning.
 
-    Must be module-level (not a method) for pickling with forkserver.
+    *indices* is a list of integer indices into the module-level
+    ``_worker_file_data`` list so that file contents are never
+    serialised through the multiprocessing pipe.
     """
-    file_chunk, config, profile, debug, ignore_nosec = args
+    chunk = [_worker_file_data[i] for i in indices]
 
-    b_ts_local = b_test_set.BanditTestSet(config, profile)
     b_ma_local = b_meta_ast.BanditMetaAst()
     m = metrics.Metrics()
 
@@ -49,7 +69,7 @@ def _scan_file_chunk(args):
     scores = []
     skipped = []
 
-    for fname, raw_bytes in file_chunk:
+    for fname, raw_bytes in chunk:
         try:
             fdata = io.BytesIO(raw_bytes)
             lines = raw_bytes.splitlines()
@@ -60,7 +80,7 @@ def _scan_file_chunk(args):
             try:
                 fdata.seek(0)
                 tokens = tokenize.tokenize(fdata.readline)
-                if not ignore_nosec:
+                if not _worker_ignore_nosec:
                     for toktype, tokval, (lineno, _), _, _ in tokens:
                         if toktype == tokenize.COMMENT:
                             nosec_lines[lineno] = _parse_nosec_comment(tokval)
@@ -68,13 +88,12 @@ def _scan_file_chunk(args):
                 pass
 
             fdata.seek(0)
-            score = []
             res = b_node_visitor.BanditNodeVisitor(
                 fname,
                 fdata,
                 b_ma_local,
-                b_ts_local,
-                debug,
+                _worker_ts,
+                _worker_debug,
                 nosec_lines,
                 m,
             )
@@ -400,39 +419,43 @@ class BanditManager:
                     new_files_list.remove(fname)
 
             if file_data_pairs:
-                # Chunk files across workers
+                global _worker_file_data
+
+                # Sort files by size descending so the largest files
+                # are distributed first across workers via round-robin,
+                # preventing a single slow file from bottlenecking one
+                # worker.
+                file_data_pairs.sort(
+                    key=lambda pair: len(pair[1]), reverse=True
+                )
+                _worker_file_data = file_data_pairs
+
+                # Determine number of workers
                 cpu_count = multiprocessing.cpu_count()
-                if _PARALLEL_CHUNK_SIZE is not None:
-                    chunk_size = _PARALLEL_CHUNK_SIZE
-                else:
-                    chunk_size = math.ceil(
-                        len(file_data_pairs) / cpu_count
-                    )
-                chunk_size = max(chunk_size, 1)
+                n_files = len(file_data_pairs)
+                n_workers = min(cpu_count, n_files)
 
-                chunks = [
-                    file_data_pairs[i:i + chunk_size]
-                    for i in range(0, len(file_data_pairs), chunk_size)
-                ]
-                n_workers = min(cpu_count, len(chunks))
+                # Round-robin assignment: deal files to workers like
+                # cards, largest first, so work is balanced.
+                worker_indices = [[] for _ in range(n_workers)]
+                for idx in range(n_files):
+                    worker_indices[idx % n_workers].append(idx)
 
-                chunk_args = [
-                    (
-                        chunk,
+                with multiprocessing.Pool(
+                    processes=n_workers,
+                    initializer=_worker_init,
+                    initargs=(
                         self.b_conf,
                         {},
                         self.debug,
                         self.ignore_nosec,
-                    )
-                    for chunk in chunks
-                ]
-
-                with multiprocessing.Pool(
-                    processes=n_workers
+                    ),
                 ) as pool:
                     worker_results = pool.map(
-                        _scan_file_chunk, chunk_args
+                        _scan_file_chunk, worker_indices
                     )
+
+                _worker_file_data = []
 
                 # Merge results from all workers
                 merged_metrics = {}
